@@ -8,6 +8,8 @@ play plain folders, like the **Shokz OpenSwim Pro**.
 - MP3 only, no M3U files, no Liked Songs
 - Runs only when you start it (no daemon, no scheduler)
 - Optional pruning: with `"prune": true`, files for tracks you remove on Spotify are deleted locally
+- Renaming a playlist in `config.json` renames its folder instead of re-downloading it
+- Folders of playlists you remove from `config.json` are offered for deletion (asks y/N)
 - A lockfile (`.sync.lock`) stops two runs from overlapping
 
 ## Prerequisites
@@ -77,8 +79,9 @@ cp config.example.json config.json
   deleted from the playlist folder. spotdl only deletes files it recorded in that playlist's
   state file, never other files in the folder. Defaults to `false` (add new tracks only).
 - `name` is optional. Without it, the folder takes the Spotify playlist name.
-- `state_dir` holds one `<playlist-id>.spotdl` file per playlist. spotdl uses these to know
-  what was already downloaded. Relative paths resolve next to `config.json`.
+- `state_dir` holds one `<playlist-id>.spotdl` file per playlist, which spotdl uses to know
+  what was already downloaded. It also holds `folders.json`, which records each playlist's
+  folder. Relative paths resolve next to `config.json`.
 - Get a playlist URL in Spotify with **⋯ → Share → Copy link to playlist**.
 
 ## Usage
@@ -89,12 +92,29 @@ python3 sync.py                        # sync every playlist (prunes only if "pr
 python3 sync.py --only "Swim Mix"      # one playlist, by name or playlist ID
 python3 sync.py --prune                # delete removed tracks this run, whatever the config says
 python3 sync.py --keep                 # never delete this run, whatever the config says
+python3 sync.py --yes                  # delete leftover folders without the y/N question
 python3 sync.py --config other.json    # use a different config
 ```
 
 On the first run for a playlist, the wrapper calls `spotdl sync <url> --save-file
 state/<id>.spotdl`. Later runs call `spotdl sync state/<id>.spotdl`. The filename template
 must stay the same between runs: spotdl works out which files are which from it.
+
+### Renamed and removed playlists
+
+- **Renamed in `config.json`** (adding, changing or removing `name`): before syncing, the
+  playlist's existing folder is renamed to match, so nothing is downloaded again.
+- **Removed from `config.json`**: after syncing, its folder is listed with its file count and
+  size, then you're asked `Delete these? [y/N]`. Answering `y` deletes the folder and its
+  state files. `--yes` skips the question. Without a terminal (cron, scripts) and without
+  `--yes`, nothing is deleted.
+- With `"prune": false` or `--keep`, leftover folders are only reported, never deleted.
+- `--dry-run` shows planned renames and leftover folders.
+- Only folders directly inside `music_dir` that this tool recorded are ever deleted. A
+  folder another configured playlist still uses is never touched.
+
+When you delete or unfollow a playlist on Spotify, remove it from `config.json` too. Until
+you do, spotdl reports an error for it on every run.
 
 ## Copying to the OpenSwim Pro
 
@@ -137,8 +157,10 @@ CI (GitHub Actions) runs ruff and pytest on every push.
 - spotdl has no "no M3U" flag. If `m3u` is set in `~/.spotdl/config.json`, spotdl will still
   write M3U files, so leave it `null` there.
 - Liked Songs and non-playlist URLs (albums, artists) are rejected on purpose.
-- Changing a playlist's `name`, or the filename template, between runs makes spotdl
-  re-download those tracks into the new folder.
+- A playlist renamed **on Spotify** (with no `name` set in config) is noticed only after
+  spotdl has downloaded it into a new folder. The old folder is then offered for deletion as a
+  leftover. Set a `name` in config to keep a stable folder.
+- Changing the filename template between runs makes spotdl re-download everything.
 - Spotify API changes and YouTube anti-bot measures break spotdl and yt-dlp from time to time.
   `pipx upgrade spotdl` (and refreshing cookies) usually fixes it.
 - The OpenSwim Pro sorts tracks by filename or copy order, not playlist order.

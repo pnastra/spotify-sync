@@ -24,6 +24,7 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = REPO_DIR / "config.json"
 LOCK_NAME = ".sync.lock"
+MANIFEST_NAME = "folders.json"
 FILENAME_TEMPLATE = "{artists} - {title}.{output-ext}"
 
 PLAYLIST_URL_RE = re.compile(
@@ -278,6 +279,182 @@ class SyncLock:
         self.release()
 
 
+# --- folder bookkeeping -----------------------------------------------------
+#
+# state/folders.json remembers which folder each playlist was synced into:
+#   {"playlists": {"<id>": "<folder>"}, "leftovers": {"<old folder>": "<id>"}}
+# That lets a run rename a folder when its configured name changes (no
+# re-download) and offer to delete folders of playlists removed from config.
+
+
+@dataclass
+class Orphan:
+    playlist_id: str
+    folder: str | None  # None: folder is still used by a configured playlist
+    drop_state: bool  # playlist removed from config: delete its state files too
+
+
+def manifest_path(cfg: Config) -> Path:
+    return cfg.state_dir / MANIFEST_NAME
+
+
+def load_manifest(cfg: Config) -> dict:
+    try:
+        data = json.loads(manifest_path(cfg).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    return {
+        "playlists": dict(data.get("playlists", {})),
+        "leftovers": dict(data.get("leftovers", {})),
+    }
+
+
+def save_manifest(cfg: Config, manifest: dict) -> None:
+    path = manifest_path(cfg)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def state_list_name(cfg: Config, playlist: Playlist) -> str | None:
+    """The Spotify playlist name stored in the spotdl state file, if any."""
+    try:
+        songs = json.loads(state_file(cfg, playlist).read_text(encoding="utf-8")).get("songs")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return (songs[0].get("list_name") or None) if songs else None
+
+
+def target_folder(cfg: Config, playlist: Playlist) -> str | None:
+    """The folder this playlist should sync into, if known before running spotdl."""
+    return playlist.name or state_list_name(cfg, playlist)
+
+
+def synced_folder(cfg: Config, playlist: Playlist) -> str | None:
+    """The folder this playlist's tracks live in, if it can be determined."""
+    name = target_folder(cfg, playlist)
+    return name if name and (playlist.name or (cfg.music_dir / name).is_dir()) else None
+
+
+def record_folder(cfg: Config, manifest: dict, playlist: Playlist) -> None:
+    folder = synced_folder(cfg, playlist)
+    if not folder:
+        return
+    old = manifest["playlists"].get(playlist.playlist_id)
+    if old and old != folder and (cfg.music_dir / old).is_dir():
+        manifest["leftovers"][old] = playlist.playlist_id  # e.g. renamed on Spotify
+    manifest["playlists"][playlist.playlist_id] = folder
+    manifest["leftovers"].pop(folder, None)
+
+
+def plan_renames(cfg: Config, manifest: dict) -> list[tuple[str, str, str]]:
+    """(playlist_id, old, new) for playlists whose folder name changed in config.
+
+    Covers adding, changing or removing a "name" (the latter falls back to the
+    Spotify name saved in the state file). Renames made on Spotify itself are
+    only seen after spotdl runs, so those still re-download (see README).
+    """
+    plans = []
+    for p in cfg.playlists:
+        old = manifest["playlists"].get(p.playlist_id)
+        new = target_folder(cfg, p)
+        if new and old and old != new and (cfg.music_dir / old).is_dir():
+            plans.append((p.playlist_id, old, new))
+    return plans
+
+
+def apply_renames(cfg: Config, manifest: dict) -> list[str]:
+    messages = []
+    for pid, old, new in plan_renames(cfg, manifest):
+        src, dst = cfg.music_dir / old, cfg.music_dir / new
+        if dst.exists():
+            manifest["leftovers"][old] = pid
+            messages.append(f"'{new}' already exists; '{old}' is now a leftover folder")
+        else:
+            src.rename(dst)
+            messages.append(f"renamed folder '{old}' -> '{new}'")
+        manifest["playlists"][pid] = new
+    return messages
+
+
+def find_orphans(cfg: Config, manifest: dict) -> list[Orphan]:
+    configured = {p.playlist_id for p in cfg.playlists}
+    in_use = {p.name for p in cfg.playlists if p.name}
+    in_use |= {f for pid, f in manifest["playlists"].items() if pid in configured}
+    orphans = [
+        Orphan(pid, None if folder in in_use else folder, drop_state=True)
+        for pid, folder in sorted(manifest["playlists"].items())
+        if pid not in configured
+    ]
+    orphans += [
+        Orphan(pid, folder, drop_state=False)
+        for folder, pid in sorted(manifest["leftovers"].items())
+        if folder not in in_use
+    ]
+    return orphans
+
+
+def _folder_summary(path: Path) -> str:
+    if not path.is_dir():
+        return "already gone"
+    files = [f for f in path.rglob("*") if f.is_file()]
+    size = sum(f.stat().st_size for f in files) / 1_000_000
+    return f"{len(files)} files, {size:.1f} MB"
+
+
+def describe_orphan(cfg: Config, o: Orphan) -> str:
+    why = "removed from config" if o.drop_state else "old folder"
+    if o.folder is None:
+        return f"  (state only) playlist {o.playlist_id}: {why}"
+    return f"  {cfg.music_dir / o.folder}/  ({_folder_summary(cfg.music_dir / o.folder)}; {why})"
+
+
+def delete_orphan(cfg: Config, manifest: dict, o: Orphan) -> None:
+    if o.folder is not None:
+        path = cfg.music_dir / o.folder
+        # Only ever delete a direct child of music_dir.
+        if o.folder in ("", ".", "..") or path.resolve().parent != cfg.music_dir.resolve():
+            raise ValueError(f"refusing to delete {path}")
+        if path.is_dir():
+            shutil.rmtree(path)
+        manifest["leftovers"].pop(o.folder, None)
+    if o.drop_state:
+        playlist = Playlist(url="", playlist_id=o.playlist_id)
+        state_file(cfg, playlist).unlink(missing_ok=True)
+        errors_file(cfg, playlist).unlink(missing_ok=True)
+        manifest["playlists"].pop(o.playlist_id, None)
+
+
+def confirm(question: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("not a terminal; skipping (use --yes to delete without asking)")
+        return False
+    try:
+        return input(question).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def handle_orphans(cfg: Config, manifest: dict, prune: bool, assume_yes: bool) -> None:
+    orphans = find_orphans(cfg, manifest)
+    if not orphans:
+        return
+    print("\nFolders no longer matching any playlist in config:")
+    for o in orphans:
+        print(describe_orphan(cfg, o))
+    if not prune:
+        print("Not deleted (prune is off; run with --prune to remove them).")
+        return
+    if not confirm("Delete these? [y/N] ", assume_yes):
+        print("Kept.")
+        return
+    for o in orphans:
+        delete_orphan(cfg, manifest, o)
+        print(f"deleted {o.folder or 'state for ' + o.playlist_id}")
+
+
 def check_tools() -> list[str]:
     return [t for t in ("spotdl", "ffmpeg") if shutil.which(t) is None]
 
@@ -313,6 +490,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_false",
         help="never delete local files on this run (overrides config)",
     )
+    ap.add_argument(
+        "--yes", action="store_true", help="delete leftover folders without asking (with prune)"
+    )
     args = ap.parse_args(argv)
 
     try:
@@ -334,8 +514,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"warning: cookie file not found: {cfg.cookie_file}", file=sys.stderr)
 
     if args.dry_run:
+        manifest = load_manifest(cfg)
+        for _, old, new in plan_renames(cfg, manifest):
+            print(f"# would rename folder '{old}' -> '{new}'")
         for p in playlists:
             print(shlex.join(build_command(cfg, p, prune=prune)))
+        orphans = find_orphans(cfg, manifest)
+        if orphans:
+            print(f"# leftover folders ({'would ask to delete' if prune else 'kept, prune off'}):")
+            for o in orphans:
+                print("#" + describe_orphan(cfg, o))
         return 0
 
     missing = check_tools()
@@ -350,21 +538,29 @@ def main(argv: list[str] | None = None) -> int:
     failures = 0
     try:
         with SyncLock(REPO_DIR / LOCK_NAME):
-            for p in playlists:
-                print(f"==> {p.name or p.playlist_id}", flush=True)
-                if p.name:
-                    (cfg.music_dir / p.name).mkdir(parents=True, exist_ok=True)
-                ef = errors_file(cfg, p)
-                ef.unlink(missing_ok=True)  # spotdl appends; keep only this run's errors
-                rc = subprocess.call(build_command(cfg, p, prune=prune))
-                failed = read_errors(ef)
-                if rc != 0:
-                    failures += 1
-                    print(f"spotdl exited with {rc} for {p.url}", file=sys.stderr)
-                elif failed:
-                    # spotdl exits 0 even when individual tracks fail
-                    failures += 1
-                    print(f"{len(failed)} track(s) failed; see {ef}", file=sys.stderr)
+            manifest = load_manifest(cfg)
+            try:
+                for msg in apply_renames(cfg, manifest):
+                    print(msg)
+                for p in playlists:
+                    print(f"==> {p.name or p.playlist_id}", flush=True)
+                    if p.name:
+                        (cfg.music_dir / p.name).mkdir(parents=True, exist_ok=True)
+                    ef = errors_file(cfg, p)
+                    ef.unlink(missing_ok=True)  # spotdl appends; keep only this run's errors
+                    rc = subprocess.call(build_command(cfg, p, prune=prune))
+                    record_folder(cfg, manifest, p)
+                    failed = read_errors(ef)
+                    if rc != 0:
+                        failures += 1
+                        print(f"spotdl exited with {rc} for {p.url}", file=sys.stderr)
+                    elif failed:
+                        # spotdl exits 0 even when individual tracks fail
+                        failures += 1
+                        print(f"{len(failed)} track(s) failed; see {ef}", file=sys.stderr)
+                handle_orphans(cfg, manifest, prune, args.yes)
+            finally:
+                save_manifest(cfg, manifest)
     except LockError as exc:
         print(exc, file=sys.stderr)
         return 3

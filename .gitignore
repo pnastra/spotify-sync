@@ -1,0 +1,32 @@
+# Local config, credentials and cookies -- never commit
+config.json
+.env
+.env.*
+cookies*.txt
+*cookies*.txt
+
+# spotdl playlist state and run lock
+*.spotdl
+state/
+.sync.lock
+
+# Audio
+*.mp3
+*.m4a
+*.flac
+*.opus
+*.ogg
+*.wav
+*.lrc
+music/
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# OS
+.DS_Store

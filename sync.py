@@ -493,7 +493,22 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--yes", action="store_true", help="delete leftover folders without asking (with prune)"
     )
+    ap.add_argument(
+        "--update",
+        action="store_true",
+        help="first refresh config.json from your Spotify account (runs update_config.py)",
+    )
     args = ap.parse_args(argv)
+
+    if args.update:
+        cmd = [sys.executable, str(REPO_DIR / "update_config.py"), "--config", str(args.config)]
+        if args.dry_run:
+            cmd.append("--dry-run")
+        if args.yes:
+            cmd.append("--yes")
+        rc = subprocess.call(cmd)
+        if rc != 0:
+            return rc
 
     try:
         cfg = load_config(args.config)

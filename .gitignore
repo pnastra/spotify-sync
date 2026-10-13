@@ -30,3 +30,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# config backups written by update_config.py
+*.bak

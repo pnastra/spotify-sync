@@ -116,6 +116,31 @@ must stay the same between runs: spotdl works out which files are which from it.
 When you delete or unfollow a playlist on Spotify, remove it from `config.json` too. Until
 you do, spotdl reports an error for it on every run.
 
+### Keeping `config.json` in step with your Spotify account
+
+`update_config.py` rewrites the `playlists` list in `config.json` with the playlists **you
+created**. Playlists you only follow are left out, and so are any named in the optional
+`"exclude_playlists"` setting (default: `My Shazam Tracks`, `Liked Songs`). Liked Songs is not a
+playlist in Spotify's API, so it is never included.
+
+```sh
+python3 update_config.py --dry-run     # show what would be added/removed, change nothing
+python3 update_config.py               # show changes, ask y/N, write config.json
+python3 update_config.py --no-browser  # print the login link instead of opening a browser
+python3 sync.py --update               # refresh the list, then sync
+```
+
+- It reuses the credentials in `~/.spotdl/config.json` and spotdl's Python environment (no extra
+  installs). The first run needs a one-time browser login with read-only access to your private
+  playlists. Add `http://127.0.0.1:9900/` to your Spotify app's **Redirect URIs** first.
+- Only the `playlists` key is rewritten; other settings and any `name` you set are kept.
+  A backup is saved as `config.json.bak`.
+- It refuses to write if Spotify returns nothing, or fewer than half your current playlists.
+- It never touches music files. Folders of removed playlists are offered for deletion by
+  `sync.py` (see above).
+- "Created by you" means Spotify lists you as the owner. Playlists made by a collaborator and
+  shared with you count as followed and are left out.
+
 ## Copying to the OpenSwim Pro
 
 The OpenSwim Pro shows up as a USB drive when it's connected with its magnetic cable.

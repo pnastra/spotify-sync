@@ -68,6 +68,7 @@ cp config.example.json config.json
   "threads": 4,
   "audio": ["youtube-music"],
   "prune": false,
+  "official_only": false,
   "playlists": [
     { "name": "Swim Mix", "url": "https://open.spotify.com/playlist/…" },
     "https://open.spotify.com/playlist/…"
@@ -78,6 +79,11 @@ cp config.example.json config.json
 - `prune`: when `true`, a track you remove from the Spotify playlist also has its MP3
   deleted from the playlist folder. spotdl only deletes files it recorded in that playlist's
   state file, never other files in the folder. Defaults to `false` (add new tracks only).
+- `official_only`: when `true`, only official YouTube Music *songs* are used. Live concerts, music
+  videos and fan uploads are never downloaded; a track with no official song is skipped and
+  listed in `state/<playlist-id>.errors.txt`. Defaults to `false` (videos are a fallback).
+- `english_search` (default `true`): see [Why a launcher?](#why-a-launcher-spotdl_enpy).
+- `log_dir` (default `logs`): where run logs are written.
 - `name` is optional. Without it, the folder takes the Spotify playlist name.
 - `state_dir` holds one `<playlist-id>.spotdl` file per playlist, which spotdl uses to know
   what was already downloaded. It also holds `folders.json`, which records each playlist's
@@ -93,12 +99,38 @@ python3 sync.py --only "Swim Mix"      # one playlist, by name or playlist ID
 python3 sync.py --prune                # delete removed tracks this run, whatever the config says
 python3 sync.py --keep                 # never delete this run, whatever the config says
 python3 sync.py --yes                  # delete leftover folders without the y/N question
+python3 sync.py --official-only        # this run: official songs only, whatever the config says
+python3 sync.py --any-source           # this run: allow videos as a fallback
+python3 sync.py --no-log               # do not write a log file this run
 python3 sync.py --config other.json    # use a different config
 ```
 
 On the first run for a playlist, the wrapper calls `spotdl sync <url> --save-file
 state/<id>.spotdl`. Later runs call `spotdl sync state/<id>.spotdl`. The filename template
 must stay the same between runs: spotdl works out which files are which from it.
+
+### Logs and the end-of-run summary
+
+Every run writes `logs/sync-<date>_<time>.log` (gitignored) and finishes with a summary:
+
+```
+== Summary ==
+10 official songs, 2 from videos, 41 already present, 1 not found
+  from videos: Artist - Title; Artist - Other Title
+```
+
+"Official songs" came from a `music.youtube.com` link, "from videos" from a `www.youtube.com`
+link (live recordings, fan uploads, music videos), and the titles of video-sourced tracks are
+listed so you can check them. To see where each track came from later:
+`grep -E "Downloaded|LookupError" logs/*.log`.
+
+### Why a launcher (`spotdl_en.py`)?
+
+spotdl 4.5.2 creates its YouTube Music search client with `language="de"`. In that mode the
+"Songs" search returns nothing, so spotdl never finds official songs and always falls back to
+videos. `spotdl_en.py` switches that one setting to English and then runs spotdl unchanged, using
+the Python environment of your pipx-installed spotdl. Set `"english_search": false` to run plain
+`spotdl` instead (for example once the bug is fixed upstream).
 
 ### Renamed and removed playlists
 
@@ -172,7 +204,7 @@ CI (GitHub Actions) runs ruff and pytest on every push.
 ## Known limitations
 
 - Audio comes from YouTube/YouTube Music, not from Spotify. Wrong matches happen (live
-  versions, covers, extended mixes), and quality depends on the source (usually ~128–160 kbps
+  versions, covers, extended mixes; `official_only` removes most of the live and video ones), and quality depends on the source (usually ~128–160 kbps
   AAC/Opus re-encoded to MP3). A higher `bitrate` setting can't add back quality the source
   doesn't have.
 - Some tracks have no match on YouTube Music ("LookupError: No results found"). They're

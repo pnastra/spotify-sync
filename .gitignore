@@ -33,3 +33,7 @@ __pycache__/
 
 # config backups written by update_config.py
 *.bak
+
+# run logs
+logs/
+*.log

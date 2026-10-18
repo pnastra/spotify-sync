@@ -134,7 +134,8 @@ def test_stale_lock_is_replaced(tmp_path):
 # --- CLI --------------------------------------------------------------------
 
 
-def test_dry_run_prints_commands(tmp_path, capsys):
+def test_dry_run_prints_commands(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(sync, "spotdl_python", lambda: None)  # plain spotdl, no launcher
     assert sync.main(["--config", str(write_config(tmp_path)), "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert out.startswith("spotdl sync ")
@@ -337,3 +338,78 @@ def test_removing_name_renames_back_to_spotify_name(tmp_path):
     sync.apply_renames(cfg, m)
     assert (cfg.music_dir / "Spotify Name" / "t0.mp3").exists()
     assert m["playlists"][PID] == "Spotify Name"
+
+
+# --- English-search launcher, official_only, log tally ---------------------------
+
+
+def test_build_command_accepts_prefix_list_and_official_flag(cfg):
+    cmd = sync.build_command(cfg, cfg.playlists[0], spotdl=["py", "-I", "launcher.py"])
+    assert cmd[:5] == [
+        "py",
+        "-I",
+        "launcher.py",
+        "sync",
+        f"https://open.spotify.com/playlist/{PID}",
+    ]
+    assert "--only-verified-results" not in cmd
+    cmd = sync.build_command(cfg, cfg.playlists[0], official_only=True)
+    assert "--only-verified-results" in cmd
+
+
+def test_official_and_english_flags_load_and_validate(tmp_path):
+    cfg = sync.load_config(write_config(tmp_path))
+    assert (cfg.official_only, cfg.english_search) == (False, True)
+    cfg = sync.load_config(write_config(tmp_path, official_only=True, english_search=False))
+    assert (cfg.official_only, cfg.english_search) == (True, False)
+    with pytest.raises(sync.ConfigError, match="official_only"):
+        sync.load_config(write_config(tmp_path, official_only="yes"))
+
+
+def test_resolve_spotdl_uses_launcher_or_falls_back(cfg, monkeypatch, capsys):
+    monkeypatch.setattr(sync, "spotdl_python", lambda: "/venv/bin/python")
+    assert sync.resolve_spotdl(cfg) == ["/venv/bin/python", "-I", str(sync.LAUNCHER)]
+    monkeypatch.setattr(sync, "spotdl_python", lambda: None)
+    assert sync.resolve_spotdl(cfg) == ["spotdl"]
+    assert "warning" in capsys.readouterr().err
+    cfg.english_search = False
+    assert sync.resolve_spotdl(cfg) == ["spotdl"]
+
+
+def test_launcher_switches_to_english():
+    text = sync.LAUNCHER.read_text()
+    assert 'language="en"' in text and "_create_client" in text
+
+
+def test_tally_classifies_sources_and_handles_wrapped_urls():
+    t = sync.Tally()
+    for line in [
+        'Downloaded "Artist - Song A": https://music.youtube.com/watch?v=aaa',
+        'Downloaded "Artist - Song B":',
+        "https://www.youtube.com/watch?v=bbb",
+        "Skipping Artist - Song C (file already exists)",
+        "unrelated line https://www.youtube.com/watch?v=zzz",
+    ]:
+        t.feed(line)
+    t.not_found = 2
+    assert t.songs == ["Artist - Song A"]
+    assert t.videos == ["Artist - Song B"]
+    assert t.existing == 1
+    text = t.summary()
+    assert "1 official songs, 1 from videos, 1 already present, 2 not found" in text
+    assert "Artist - Song B" in text
+
+
+def test_tally_add():
+    a, b = sync.Tally(songs=["x"], existing=1), sync.Tally(videos=["y"], not_found=3)
+    a.add(b)
+    assert (a.songs, a.videos, a.existing, a.not_found) == (["x"], ["y"], 1, 3)
+
+
+def test_run_logged_streams_and_tallies(tmp_path):
+    script = 'print(\'Downloaded "T":\'); print("https://music.youtube.com/watch?v=q")'
+    t = sync.Tally()
+    with open(tmp_path / "x.log", "w") as log:
+        rc = sync.run_logged([sys.executable, "-c", script], log, t)
+    assert rc == 0 and t.songs == ["T"]
+    assert "music.youtube.com" in (tmp_path / "x.log").read_text()

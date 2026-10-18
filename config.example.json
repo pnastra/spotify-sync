@@ -6,6 +6,7 @@
   "threads": 4,
   "audio": ["youtube-music"],
   "prune": false,
+  "official_only": false,
   "playlists": [
     { "name": "Swim Mix", "url": "https://open.spotify.com/playlist/REPLACE_WITH_22_CHAR_ID" },
     { "url": "https://open.spotify.com/playlist/ANOTHER_22_CHAR_ID_HERE" }

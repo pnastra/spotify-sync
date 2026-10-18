@@ -19,12 +19,16 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = REPO_DIR / "config.json"
 LOCK_NAME = ".sync.lock"
 MANIFEST_NAME = "folders.json"
+LAUNCHER = REPO_DIR / "spotdl_en.py"
+DOWNLOADED_RE = re.compile(r'^Downloaded "(.*?)"')
+SOURCE_RE = re.compile(r"https://(music|www)\.youtube\.com/watch")
 FILENAME_TEMPLATE = "{artists} - {title}.{output-ext}"
 
 PLAYLIST_URL_RE = re.compile(
@@ -82,6 +86,9 @@ class Config:
     threads: int = 4
     audio: list[str] = field(default_factory=lambda: ["youtube-music"])
     prune: bool = False
+    official_only: bool = False
+    english_search: bool = True
+    log_dir: Path = Path("logs")
     playlists: list[Playlist] = field(default_factory=list)
 
 
@@ -161,6 +168,12 @@ def load_config(path: Path) -> Config:
     if not isinstance(prune, bool):
         raise ConfigError("prune must be true or false.")
 
+    flags = {}
+    for key, default in (("official_only", False), ("english_search", True)):
+        flags[key] = raw.get(key, default)
+        if not isinstance(flags[key], bool):
+            raise ConfigError(f"{key} must be true or false.")
+
     cookie = raw.get("cookie_file")
     return Config(
         music_dir=_expand(raw["music_dir"], base),
@@ -170,6 +183,9 @@ def load_config(path: Path) -> Config:
         threads=threads,
         audio=list(raw.get("audio", ["youtube-music"])),
         prune=prune,
+        official_only=flags["official_only"],
+        english_search=flags["english_search"],
+        log_dir=_expand(raw.get("log_dir", "logs"), base),
         playlists=playlists,
     )
 
@@ -191,19 +207,51 @@ def read_errors(path: Path) -> list[str]:
     return [line for line in lines if line.startswith("http")]
 
 
+def spotdl_python() -> str | None:
+    """Python interpreter of the (pipx) environment that runs spotdl."""
+    exe = shutil.which("spotdl")
+    if not exe:
+        return None
+    try:
+        first = Path(exe).read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+    except (OSError, IndexError):
+        return None
+    py = first[2:].strip() if first.startswith("#!") else None
+    return py if py and Path(py).exists() else None
+
+
+def resolve_spotdl(cfg: Config) -> list[str]:
+    """The command prefix that runs spotdl (English-search launcher when possible)."""
+    if cfg.english_search:
+        py = spotdl_python()
+        if py:
+            return [py, "-I", str(LAUNCHER)]
+        print(
+            "warning: could not find spotdl's Python; using plain spotdl, whose song "
+            "search may return nothing (set english_search to false to silence this).",
+            file=sys.stderr,
+        )
+    return ["spotdl"]
+
+
 def build_command(
-    cfg: Config, playlist: Playlist, prune: bool = False, spotdl: str = "spotdl"
+    cfg: Config,
+    playlist: Playlist,
+    prune: bool = False,
+    spotdl: str | list[str] = "spotdl",
+    official_only: bool = False,
 ) -> list[str]:
     """Build the `spotdl sync` command for one playlist.
 
     First run: sync from the URL and write the .spotdl state file.
     Later runs: sync from the state file (spotdl refuses --save-file then).
     """
+    prefix = [spotdl] if isinstance(spotdl, str) else list(spotdl)
     sf = state_file(cfg, playlist)
     if sf.exists():
-        cmd = [spotdl, "sync", str(sf)]
+        cmd = [*prefix, "sync", str(sf)]
     else:
-        cmd = [spotdl, "sync", playlist.url, "--save-file", str(sf)]
+        cmd = [*prefix, "sync", playlist.url, "--save-file", str(sf)]
 
     output = cfg.music_dir / playlist.folder / FILENAME_TEMPLATE
     cmd += [
@@ -225,9 +273,81 @@ def build_command(
     ]
     if cfg.cookie_file:
         cmd += ["--cookie-file", str(cfg.cookie_file)]
+    if official_only:
+        cmd.append("--only-verified-results")
     if not prune:
         cmd.append("--sync-without-deleting")
     return cmd
+
+
+# --- run log and summary --------------------------------------------------------
+#
+# spotdl prints `Downloaded "<title>":` and then the source link. A music.youtube.com
+# link is an official song; a www.youtube.com link is a video (live, fan upload, ...).
+
+
+@dataclass
+class Tally:
+    songs: list[str] = field(default_factory=list)
+    videos: list[str] = field(default_factory=list)
+    existing: int = 0
+    not_found: int = 0
+    _pending: str | None = None
+
+    def feed(self, line: str) -> None:
+        line = line.strip()
+        match = DOWNLOADED_RE.match(line)
+        if match:
+            self._pending = match.group(1)
+        if self._pending is not None:
+            source = SOURCE_RE.search(line)
+            if source:
+                (self.songs if source.group(1) == "music" else self.videos).append(self._pending)
+                self._pending = None
+        if line.startswith("Skipping") and "already exists" in line:
+            self.existing += 1
+
+    def add(self, other: Tally) -> None:
+        self.songs += other.songs
+        self.videos += other.videos
+        self.existing += other.existing
+        self.not_found += other.not_found
+
+    def summary(self) -> str:
+        lines = [
+            f"{len(self.songs)} official songs, {len(self.videos)} from videos, "
+            f"{self.existing} already present, {self.not_found} not found"
+        ]
+        if self.videos:
+            lines.append("  from videos: " + "; ".join(self.videos))
+        return "\n".join(lines)
+
+
+def run_logged(cmd: list[str], log, tally: Tally) -> int:
+    """Run cmd, showing its output, copying it to the log and counting sources."""
+    env = {**os.environ, "COLUMNS": "250"}  # keep links on one line when output is piped
+    log.write(f"\n$ {shlex.join(cmd)}\n")
+    log.flush()
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1,
+        env=env,
+    )
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log.write(line)
+            tally.feed(line)
+    finally:
+        proc.stdout.close()
+        proc.wait()
+        log.flush()
+    return proc.returncode
 
 
 def _pid_alive(pid: int) -> bool:
@@ -493,6 +613,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--yes", action="store_true", help="delete leftover folders without asking (with prune)"
     )
+    source = ap.add_mutually_exclusive_group()
+    source.add_argument(
+        "--official-only",
+        dest="official",
+        action="store_true",
+        default=None,
+        help="only use official YouTube Music songs, never videos (overrides config)",
+    )
+    source.add_argument(
+        "--any-source",
+        dest="official",
+        action="store_false",
+        help="allow videos as a fallback (overrides config)",
+    )
+    ap.add_argument("--no-log", action="store_true", help="do not write a log file for this run")
     ap.add_argument(
         "--update",
         action="store_true",
@@ -517,6 +652,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     prune = cfg.prune if args.prune is None else args.prune
+    official = cfg.official_only if args.official is None else args.official
+    spotdl = resolve_spotdl(cfg)
     playlists = cfg.playlists
     if args.only:
         wanted = set(args.only)
@@ -533,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
         for _, old, new in plan_renames(cfg, manifest):
             print(f"# would rename folder '{old}' -> '{new}'")
         for p in playlists:
-            print(shlex.join(build_command(cfg, p, prune=prune)))
+            print(shlex.join(build_command(cfg, p, prune, spotdl, official)))
         orphans = find_orphans(cfg, manifest)
         if orphans:
             print(f"# leftover folders ({'would ask to delete' if prune else 'kept, prune off'}):")
@@ -550,7 +687,17 @@ def main(argv: list[str] | None = None) -> int:
         print("prune is ON: files for tracks removed on Spotify will be deleted.", flush=True)
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     cfg.music_dir.mkdir(parents=True, exist_ok=True)
+    if official:
+        print("official songs only: tracks with no official song are skipped.", flush=True)
     failures = 0
+    total = Tally()
+    log_path = None
+    log = open(os.devnull, "w")  # replaced below unless --no-log
+    if not args.no_log:
+        cfg.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = cfg.log_dir / f"sync-{datetime.now():%Y-%m-%d_%H%M%S}.log"
+        log = open(log_path, "w", encoding="utf-8")
+        print(f"log: {log_path}")
     try:
         with SyncLock(REPO_DIR / LOCK_NAME):
             manifest = load_manifest(cfg)
@@ -563,9 +710,13 @@ def main(argv: list[str] | None = None) -> int:
                         (cfg.music_dir / p.name).mkdir(parents=True, exist_ok=True)
                     ef = errors_file(cfg, p)
                     ef.unlink(missing_ok=True)  # spotdl appends; keep only this run's errors
-                    rc = subprocess.call(build_command(cfg, p, prune=prune))
+                    tally = Tally()
+                    cmd = build_command(cfg, p, prune, spotdl, official)
+                    rc = run_logged(cmd, log, tally)
                     record_folder(cfg, manifest, p)
                     failed = read_errors(ef)
+                    tally.not_found = len(failed)
+                    total.add(tally)
                     if rc != 0:
                         failures += 1
                         print(f"spotdl exited with {rc} for {p.url}", file=sys.stderr)
@@ -576,11 +727,17 @@ def main(argv: list[str] | None = None) -> int:
                 handle_orphans(cfg, manifest, prune, args.yes)
             finally:
                 save_manifest(cfg, manifest)
+                print("\n== Summary ==\n" + total.summary())
+                log.write("\n== Summary ==\n" + total.summary() + "\n")
     except LockError as exc:
         print(exc, file=sys.stderr)
         return 3
     except KeyboardInterrupt:
         return 130
+    finally:
+        log.close()
+    if log_path:
+        print(f"log saved: {log_path}")
     return 1 if failures else 0
 
 
